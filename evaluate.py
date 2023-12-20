@@ -23,7 +23,7 @@ import torchvision.transforms as transforms
 import torch.backends.cudnn as cudnn
 
 import networks
-from datasets.datasets import LIPDataValSet
+from datasets.datasets import LIPDataTestSet
 from utils.miou import compute_mean_ioU
 from utils.transforms import BGR2RGB_transform
 from utils.transforms import transform_parsing
@@ -54,6 +54,7 @@ def get_arguments():
     parser.add_argument("--save-results", action="store_true", help="whether to save the results.")
     parser.add_argument("--flip", action="store_true", help="random flip during the test.")
     parser.add_argument("--multi-scales", type=str, default='1', help="multiple scales during the test")
+    parser.add_argument("--cal-mou", action="store_true", help="calculate mou")
     return parser.parse_args()
 
 
@@ -93,6 +94,8 @@ def multi_scale_testing(model, batch_input_im, crop_size=[473, 473], flip=True, 
     for s in multi_scales:
         interp_im = torch.nn.Upsample(scale_factor=s, mode='bilinear', align_corners=True)
         scaled_im = interp_im(batch_input_im)
+        
+        # Remove .cuda() as GPU operations are not allowed
         parsing_output = model(scaled_im)
         parsing_output = parsing_output[0][-1]
         output = parsing_output[0]
@@ -116,13 +119,6 @@ def main():
     """Create the model and start the evaluation process."""
     args = get_arguments()
     multi_scales = [float(i) for i in args.multi_scales.split(',')]
-    gpus = [int(i) for i in args.gpu.split(',')]
-    assert len(gpus) == 1
-    if not args.gpu == 'None':
-        os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
-
-    cudnn.benchmark = True
-    cudnn.enabled = True
 
     h, w = map(int, args.input_size.split(','))
     input_size = [h, w]
@@ -139,34 +135,26 @@ def main():
         print('BGR Transformation')
         transform = transforms.Compose([
             transforms.ToTensor(),
-            transforms.Normalize(mean=IMAGE_MEAN,
-                                 std=IMAGE_STD),
-
+            transforms.Normalize(mean=IMAGE_MEAN, std=IMAGE_STD),
         ])
     if INPUT_SPACE == 'RGB':
         print('RGB Transformation')
         transform = transforms.Compose([
             transforms.ToTensor(),
             BGR2RGB_transform(),
-            transforms.Normalize(mean=IMAGE_MEAN,
-                                 std=IMAGE_STD),
+            transforms.Normalize(mean=IMAGE_MEAN, std=IMAGE_STD),
         ])
 
     # Data loader
-    lip_test_dataset = LIPDataValSet(args.data_dir, 'val', crop_size=input_size, transform=transform, flip=args.flip)
+    lip_test_dataset = LIPDataTestSet(args.data_dir, 'val', crop_size=input_size, transform=transform, flip=args.flip)
     num_samples = len(lip_test_dataset)
-    print('Totoal testing sample numbers: {}'.format(num_samples))
-    testloader = data.DataLoader(lip_test_dataset, batch_size=args.batch_size, shuffle=False, pin_memory=True)
+    print('Total testing sample numbers: {}'.format(num_samples))
+    testloader = data.DataLoader(lip_test_dataset, batch_size=args.batch_size, shuffle=False, pin_memory=False)
 
     # Load model weight
-    state_dict = torch.load(args.model_restore)['state_dict']
-    from collections import OrderedDict
-    new_state_dict = OrderedDict()
-    for k, v in state_dict.items():
-        name = k[7:]  # remove `module.`
-        new_state_dict[name] = v
-    model.load_state_dict(new_state_dict)
-    model.cuda()
+    state_dict = torch.load(args.model_restore, map_location=torch.device('cpu'))['state_dict']
+    model.load_state_dict(state_dict)
+    model.cpu()
     model.eval()
 
     sp_results_dir = os.path.join(args.log_dir, 'sp_results')
@@ -180,7 +168,7 @@ def main():
     with torch.no_grad():
         for idx, batch in enumerate(tqdm(testloader)):
             image, meta = batch
-            if (len(image.shape) > 4):
+            if len(image.shape) > 4:
                 image = image.squeeze()
             im_name = meta['name'][0]
             c = meta['center'].numpy()[0]
@@ -189,21 +177,25 @@ def main():
             h = meta['height'].numpy()[0]
             scales[idx, :] = s
             centers[idx, :] = c
-            parsing, logits = multi_scale_testing(model, image.cuda(), crop_size=input_size, flip=args.flip,
+            parsing, logits = multi_scale_testing(model, image, crop_size=input_size, flip=args.flip,
                                                   multi_scales=multi_scales)
             if args.save_results:
                 parsing_result = transform_parsing(parsing, c, s, w, h, input_size)
+                if '.jpeg' in im_name:
+                    im_name = im_name.split('.')[0]
                 parsing_result_path = os.path.join(sp_results_dir, im_name + '.png')
+                parsing_result_binary_path = os.path.join('/home/ubuntu/generated/person_mask.png')
                 output_im = PILImage.fromarray(np.asarray(parsing_result, dtype=np.uint8))
+                output_im.save(parsing_result_binary_path)
                 output_im.putpalette(palette)
                 output_im.save(parsing_result_path)
 
             parsing_preds.append(parsing)
     assert len(parsing_preds) == num_samples
-    mIoU = compute_mean_ioU(parsing_preds, scales, centers, args.num_classes, args.data_dir, input_size)
-    print(mIoU)
+    if args.cal_mou:
+        mIoU = compute_mean_ioU(parsing_preds, scales, centers, args.num_classes, args.data_dir, input_size)
+        print(mIoU)
     return
-
 
 if __name__ == '__main__':
     main()

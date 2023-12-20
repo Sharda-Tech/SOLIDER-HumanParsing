@@ -1380,7 +1380,7 @@ class SwinTransformer(BaseModule):
         if self.semantic_weight >= 0:
             w = torch.ones(x.shape[0],1) * self.semantic_weight
             w = torch.cat([w, 1-w], axis=-1)
-            semantic_weight = w.cuda()
+            semantic_weight = w
 
         x, hw_shape = self.patch_embed(x) # b, h*w, c
         if self.use_abs_pos_embed:
